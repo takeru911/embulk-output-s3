@@ -2,6 +2,7 @@ package org.embulk.output;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -29,7 +30,11 @@ import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.services.s3.AmazonS3Client;
 import com.amazonaws.services.s3.model.CannedAccessControlList;
 import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.services.s3.model.SSEAwsKeyManagementParams;
+import com.amazonaws.services.s3.model.ObjectMetadata;
 import com.google.common.base.Optional;
+
+import org.embulk.output.EncryptOption;
 
 public class S3FileOutputPlugin
         implements FileOutputPlugin
@@ -81,6 +86,14 @@ public class S3FileOutputPlugin
         @Config("canned_acl")
         @ConfigDefault("null")
         Optional<CannedAccessControlList> getCannedAccessControlList();
+
+        @Config("encrypt_option")
+        @ConfigDefault("disable")
+        EncryptOption getEncryptOption();
+
+        @Config("encrypt_key")
+        @ConfigDefault("\"\"")
+        String getEncryptKey();
     }
 
     public static class S3FileOutput
@@ -94,8 +107,11 @@ public class S3FileOutputPlugin
         private final String sequenceFormat;
         private final String fileNameExtension;
         private final String tempPathPrefix;
+        private final String encryptKey;
+        
         private final Optional<CannedAccessControlList> cannedAccessControlListOptional;
-
+        private final EncryptOption encryptOption;
+      
         private int taskIndex;
         private int fileIndex;
         private AmazonS3Client client;
@@ -109,7 +125,8 @@ public class S3FileOutputPlugin
 
             // TODO: Support more configurations.
             ClientConfiguration config = new ClientConfiguration();
-
+            config.setSignerOverride("AWSS3V4SignerType");
+            
             if (task.getProxyHost().isPresent()) {
                 config.setProxyHost(task.getProxyHost().get());
             }
@@ -145,6 +162,9 @@ public class S3FileOutputPlugin
             this.sequenceFormat = task.getSequenceFormat();
             this.fileNameExtension = task.getFileNameExtension();
             this.tempPathPrefix = task.getTempPathPrefix();
+            this.encryptKey = task.getEncryptKey();
+            this.encryptOption = task.getEncryptOption();
+            
             if (task.getTempPath().isPresent()) {
                 this.tempPath = task.getTempPath().get();
             }
@@ -185,11 +205,30 @@ public class S3FileOutputPlugin
 
         private void putFile(Path from, String key)
         {
-            PutObjectRequest request = new PutObjectRequest(bucket, key, from.toFile());
+            PutObjectRequest request = createPutObject(key, from.toFile());
             if (cannedAccessControlListOptional.isPresent()) {
                 request.withCannedAcl(cannedAccessControlListOptional.get());
             }
             client.putObject(request);
+        }
+
+        private PutObjectRequest createPutObject(String key, File file) {
+            switch(encryptOption) {
+                case SSE:
+                    ObjectMetadata metadata = new ObjectMetadata();
+                    metadata.setSSEAlgorithm(ObjectMetadata.AES_256_SERVER_SIDE_ENCRYPTION);
+                    return new PutObjectRequest(bucket, key, file)
+                      .withMetadata(metadata);
+                case SSE_KMS:
+                    SSEAwsKeyManagementParams kmParams = new SSEAwsKeyManagementParams(encryptKey);
+                    return new PutObjectRequest(bucket, key, file)
+                        .withSSEAwsKeyManagementParams(kmParams);
+                case DISABLE:
+                    return new PutObjectRequest(bucket, key, file);
+                default:
+                    throw new ConfigException(String.format("Unknown EncryptOption value. Supported values are EncryptOption, SSE, SSE_KMS, false or disable."));
+              
+            }
         }
 
         private void closeCurrent()
